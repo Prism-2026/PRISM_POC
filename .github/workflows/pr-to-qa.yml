@@ -1,0 +1,61 @@
+
+name: Create PR to QA (Salesforce Trigger)
+
+on:
+  repository_dispatch:
+    types: [salesforce_pr_to_qa]
+
+permissions:
+  contents: read         # read repo content as needed
+  pull-requests: write   # needed to create PRs (required!)
+
+jobs:
+  create-pr:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout feature branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.client_payload.branch }}
+          fetch-depth: 0
+      # actions/checkout is the supported way to get repo files into the runner. [8](https://github.com/actions/checkout)
+
+      - name: Ensure base (QA) branch exists remotely
+        run: |
+          BASE="${{ github.event.client_payload.baseRef || 'qa' }}"
+          git fetch origin "$BASE"
+          echo "Base branch for PR: $BASE"
+
+      - name: Create PR via REST (actions/github-script)
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const branch = process.env.BRANCH;
+            const base   = process.env.BASE || 'qa';
+            const title  = `PR: ${branch} -> ${base}`;
+            const body   = [
+              `Triggered by Salesforce`,
+              `WorkItem: ${process.env.WORKITEM_ID}`,
+              `Jira: ${process.env.JIRA_URL}`,
+              `Details: ${process.env.DETAILS}`
+            ].join('\n');
+
+            // Create PR: POST /repos/{owner}/{repo}/pulls
+            // Docs: https://docs.github.com/en/rest/pulls
+            const { data: pr } = await github.rest.pulls.create({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              title,
+              head:  branch,  // source
+              base:  base,    // target
+              body
+            });
+
+            core.info(`Created PR #${pr.number}: ${pr.html_url}`);
+          env:
+            BRANCH:      ${{ github.event.client_payload.branch }}
+            BASE:        ${{ github.event.client_payload.baseRef }}
+            WORKITEM_ID: ${{ github.event.client_payload.workItemId }}
+            JIRA_URL:    ${{ github.event.client_payload.jiraUrl }}
+            DETAILS:     ${{ github.event.client_payload.details }}
