@@ -1,0 +1,40 @@
+name: Create Feature Branch (Salesforce Trigger)
+
+on:
+  repository_dispatch:
+    types: [salesforce_create_feature_branch]
+
+permissions:
+  contents: write  # Needed to push a new branch
+
+jobs:
+  create-feature-branch:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout base branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.client_payload.baseRef || 'main' }}
+
+      - name: Compute branch name
+        id: vars
+        run: |
+          DETAILS="${{ github.event.client_payload.details }}"
+          JIRA="${{ github.event.client_payload.jiraUrl }}"
+          KEY=$(echo "$JIRA" | sed -n 's#.*/browse/\([A-Za-z0-9_-]\+\).*#\1#p')
+          SAFE=$(echo "${KEY:-$DETAILS}" | tr -cd '[:alnum:]-_' | tr '[:upper:]' '[:lower:]' | cut -c1-64)
+          echo "branch=feature/${SAFE}" >> $GITHUB_OUTPUT
+
+      - name: Create and push branch
+        env:
+          BRANCH: ${{ steps.vars.outputs.branch }}
+        run: |
+          git config user.name "Salesforce Bot"
+          git config user.email "actions@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          echo "Jira: ${{ github.event.client_payload.jiraUrl }}" > README.feature.md
+          echo "Details: ${{ github.event.client_payload.details }}" >> README.feature.md
+          git add README.feature.md
+          git commit -m "chore: bootstrap $BRANCH from Salesforce"
+          git push --set-upstream origin "$BRANCH"
