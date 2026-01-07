@@ -50,10 +50,12 @@ jobs:
           WI="${{ github.event.client_payload.workItemId || inputs.workItemId }}"
           JIRA="${{ github.event.client_payload.jiraUrl || inputs.jiraUrl }}"
           DETAILS="${{ github.event.client_payload.details || inputs.details }}"
+
           if [ -z "$BRANCH" ]; then
             echo "Feature branch is required." >&2
             exit 1
           fi
+
           echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
           echo "base=$BASE" >> "$GITHUB_OUTPUT"
           echo "workItemId=$WI" >> "$GITHUB_OUTPUT"
@@ -70,29 +72,25 @@ jobs:
           SAFE=$(echo "$TAIL" | tr -cd '[:alnum:]-_' | tr '[:upper:]' '[:lower:]' | cut -c1-64)
           DUP="dup_feature/${SAFE}"
           echo "dup_branch=$DUP" >> "$GITHUB_OUTPUT"
-          echo "feature_tail=$TAIL" >> "$GITHUB_OUTPUT"
           echo "Duplicate branch will be: $DUP"
 
       # 3) Create duplicate branch via REST (points to the feature branch SHA)
       - name: Create duplicate branch ref (or confirm it exists)
         id: createref
         uses: actions/github-script@v7
+        env:
+          FEATURE: ${{ steps.inp.outputs.branch }}
+          DUP:     ${{ steps.vars.outputs.dup_branch }}
         with:
           script: |
             const owner = context.repo.owner;
             const repo  = context.repo.repo;
 
-            // Input refs
-            const feature = core.getInput('feature', { required: true });
-            const dup     = core.getInput('dup',     { required: true });
-
             // Ensure we use refs/heads/* for Git refs API
-            const featureHeadsRef = `heads/${feature}`;
-            const dupFullRef      = `refs/heads/${dup}`;
+            const featureHeadsRef = `heads/${process.env.FEATURE}`;
+            const dupFullRef      = `refs/heads/${process.env.DUP}`;
 
             // 1) Get feature ref & SHA
-            //    GET /repos/{owner}/{repo}/git/refs/heads/<feature>
-            //    (If not found, this throws)
             const featureRef = await github.rest.git.getRef({
               owner, repo, ref: featureHeadsRef
             });
@@ -103,7 +101,7 @@ jobs:
             let dupExists = false;
             try {
               const existingDup = await github.rest.git.getRef({
-                owner, repo, ref: `heads/${dup}`
+                owner, repo, ref: `heads/${process.env.DUP}`
               });
               dupExists = !!existingDup?.data?.ref;
               core.info(`Duplicate branch already exists: ${existingDup.data.ref}`);
@@ -113,26 +111,24 @@ jobs:
               core.setOutput('dup_exists', 'false');
             }
 
-            // 3) Create duplicate ref if it doesn't exist:
-            //    POST /repos/{owner}/{repo}/git/refs  with ref=refs/heads/<dup>, sha=<feature_sha>
+            // 3) Create duplicate ref if it doesn't exist
             if (!dupExists) {
               await github.rest.git.createRef({
                 owner, repo, ref: dupFullRef, sha
               });
               core.info(`Created duplicate branch ref: ${dupFullRef} -> ${sha}`);
             }
-          with:
-            feature: ${{ steps.inp.outputs.branch }}
-            dup:     ${{ steps.vars.outputs.dup_branch }}
 
       # 4) Verify base branch exists (QA), fail early if missing
       - name: Verify base branch exists (QA)
         uses: actions/github-script@v7
+        env:
+          BASE: ${{ steps.inp.outputs.base }}
         with:
           script: |
             const owner = context.repo.owner;
             const repo  = context.repo.repo;
-            const base  = core.getInput('base', { required: true });
+            const base  = process.env.BASE;
             try {
               const baseRef = await github.rest.git.getRef({
                 owner, repo, ref: `heads/${base}`
@@ -141,8 +137,6 @@ jobs:
             } catch (e) {
               core.setFailed(`Base branch '${base}' not found on origin.`);
             }
-          with:
-            base: ${{ steps.inp.outputs.base }}
 
       # 5) Find existing PR dup_feature -> base (avoid duplicates)
       - name: Find existing PR dup_feature -> base
@@ -150,7 +144,7 @@ jobs:
         uses: actions/github-script@v7
         env:
           DUP_BRANCH: ${{ steps.vars.outputs.dup_branch }}
-          BASE: ${{ steps.inp.outputs.base }}
+          BASE:       ${{ steps.inp.outputs.base }}
         with:
           script: |
             const head = `${context.repo.owner}:${process.env.DUP_BRANCH}`;
@@ -179,11 +173,11 @@ jobs:
         uses: actions/github-script@v7
         env:
           DUP_BRANCH: ${{ steps.vars.outputs.dup_branch }}
-          BASE: ${{ steps.inp.outputs.base }}
-          FEATURE: ${{ steps.inp.outputs.branch }}
-          WI: ${{ steps.inp.outputs.workItemId }}
-          JIRA: ${{ steps.inp.outputs.jiraUrl }}
-          DETAILS: ${{ steps.inp.outputs.details }}
+          BASE:       ${{ steps.inp.outputs.base }}
+          FEATURE:    ${{ steps.inp.outputs.branch }}
+          WI:         ${{ steps.inp.outputs.workItemId }}
+          JIRA:       ${{ steps.inp.outputs.jiraUrl }}
+          DETAILS:    ${{ steps.inp.outputs.details }}
         with:
           script: |
             const owner = context.repo.owner;
@@ -215,6 +209,5 @@ jobs:
           if [ "${{ steps.findpr.outputs.exists }}" = "true" ]; then
             echo "Existing PR #${{ steps.findpr.outputs.number }} -> ${{ steps.findpr.outputs.url }}"
           else
-            echo "New PR #${{ steps.createpr.outputs.number }} -> ${{
-              steps.createpr.outputs.url }}"
+            echo "New PR #${{ steps.createpr.outputs.number }} -> ${{ steps.createpr.outputs.url }}"
           fi
