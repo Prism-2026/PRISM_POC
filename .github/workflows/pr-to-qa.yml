@@ -1,6 +1,16 @@
 
 name: Create PR to QA (duplicate feature branch via REST)
 
+- name: Debug payload
+  run: |
+    echo "Event name: ${{ github.event_name }}"
+    echo "Client payload: ${{ toJson(github.event.client_payload) }}"
+    echo "Inputs: ${{ toJson(inputs) }}"
+
+- name: List branches
+  run: |
+    git ls-remote --heads origin | sed 's#^#origin: #'
+
 on:
   # Apex dispatches this exact event_type
   repository_dispatch:
