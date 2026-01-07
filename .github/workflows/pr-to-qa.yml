@@ -1,0 +1,220 @@
+
+name: Create PR to QA (duplicate feature branch via REST)
+
+on:
+  # Apex dispatches this exact event_type
+  repository_dispatch:
+    types: [salesforce_pr_to_qa]
+
+  # Optional: manual trigger for testing from Actions tab
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Feature branch to duplicate (e.g., feature/abc-123)'
+        required: true
+      baseRef:
+        description: 'Base branch for PR'
+        required: false
+        default: 'qa'
+      workItemId:
+        description: 'Salesforce WorkItem Id'
+        required: false
+      jiraUrl:
+        description: 'Jira URL'
+        required: false
+      details:
+        description: 'Work item details'
+        required: false
+
+# Needed to create branch refs and open PRs with the job's GITHUB_TOKEN
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  duplicate-and-pr:
+    runs-on: ubuntu-latest
+
+    concurrency:
+      group: pr-to-qa-${{ github.event.client_payload.branch || inputs.branch }}
+      cancel-in-progress: false
+
+    steps:
+      # 1) Resolve inputs (supports both repository_dispatch and workflow_dispatch)
+      - name: Resolve inputs
+        id: inp
+        shell: bash
+        run: |
+          BRANCH="${{ github.event.client_payload.branch || inputs.branch }}"
+          BASE="${{ github.event.client_payload.baseRef || inputs.baseRef || 'qa' }}"
+          WI="${{ github.event.client_payload.workItemId || inputs.workItemId }}"
+          JIRA="${{ github.event.client_payload.jiraUrl || inputs.jiraUrl }}"
+          DETAILS="${{ github.event.client_payload.details || inputs.details }}"
+          if [ -z "$BRANCH" ]; then
+            echo "Feature branch is required." >&2
+            exit 1
+          fi
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
+          echo "workItemId=$WI" >> "$GITHUB_OUTPUT"
+          echo "jiraUrl=$JIRA" >> "$GITHUB_OUTPUT"
+          echo "details=$DETAILS" >> "$GITHUB_OUTPUT"
+
+      # 2) Compute safe duplicate branch name (slug of feature tail)
+      - name: Compute dup branch name
+        id: vars
+        shell: bash
+        run: |
+          FEATURE="${{ steps.inp.outputs.branch }}"
+          TAIL="${FEATURE##*/}"   # e.g., feature/abc-123 -> abc-123
+          SAFE=$(echo "$TAIL" | tr -cd '[:alnum:]-_' | tr '[:upper:]' '[:lower:]' | cut -c1-64)
+          DUP="dup_feature/${SAFE}"
+          echo "dup_branch=$DUP" >> "$GITHUB_OUTPUT"
+          echo "feature_tail=$TAIL" >> "$GITHUB_OUTPUT"
+          echo "Duplicate branch will be: $DUP"
+
+      # 3) Create duplicate branch via REST (points to the feature branch SHA)
+      - name: Create duplicate branch ref (or confirm it exists)
+        id: createref
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo  = context.repo.repo;
+
+            // Input refs
+            const feature = core.getInput('feature', { required: true });
+            const dup     = core.getInput('dup',     { required: true });
+
+            // Ensure we use refs/heads/* for Git refs API
+            const featureHeadsRef = `heads/${feature}`;
+            const dupFullRef      = `refs/heads/${dup}`;
+
+            // 1) Get feature ref & SHA
+            //    GET /repos/{owner}/{repo}/git/refs/heads/<feature>
+            //    (If not found, this throws)
+            const featureRef = await github.rest.git.getRef({
+              owner, repo, ref: featureHeadsRef
+            });
+            const sha = featureRef.data.object.sha;
+            core.info(`Feature ref: ${featureRef.data.ref} -> ${sha}`);
+
+            // 2) Try to get dup ref; if present, skip creation
+            let dupExists = false;
+            try {
+              const existingDup = await github.rest.git.getRef({
+                owner, repo, ref: `heads/${dup}`
+              });
+              dupExists = !!existingDup?.data?.ref;
+              core.info(`Duplicate branch already exists: ${existingDup.data.ref}`);
+              core.setOutput('dup_exists', 'true');
+            } catch (err) {
+              core.info(`Duplicate branch does not exist yet; will create it.`);
+              core.setOutput('dup_exists', 'false');
+            }
+
+            // 3) Create duplicate ref if it doesn't exist:
+            //    POST /repos/{owner}/{repo}/git/refs  with ref=refs/heads/<dup>, sha=<feature_sha>
+            if (!dupExists) {
+              await github.rest.git.createRef({
+                owner, repo, ref: dupFullRef, sha
+              });
+              core.info(`Created duplicate branch ref: ${dupFullRef} -> ${sha}`);
+            }
+          with:
+            feature: ${{ steps.inp.outputs.branch }}
+            dup:     ${{ steps.vars.outputs.dup_branch }}
+
+      # 4) Verify base branch exists (QA), fail early if missing
+      - name: Verify base branch exists (QA)
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo  = context.repo.repo;
+            const base  = core.getInput('base', { required: true });
+            try {
+              const baseRef = await github.rest.git.getRef({
+                owner, repo, ref: `heads/${base}`
+              });
+              core.info(`Base branch found: ${baseRef.data.ref}`);
+            } catch (e) {
+              core.setFailed(`Base branch '${base}' not found on origin.`);
+            }
+          with:
+            base: ${{ steps.inp.outputs.base }}
+
+      # 5) Find existing PR dup_feature -> base (avoid duplicates)
+      - name: Find existing PR dup_feature -> base
+        id: findpr
+        uses: actions/github-script@v7
+        env:
+          DUP_BRANCH: ${{ steps.vars.outputs.dup_branch }}
+          BASE: ${{ steps.inp.outputs.base }}
+        with:
+          script: |
+            const head = `${context.repo.owner}:${process.env.DUP_BRANCH}`;
+            const base = process.env.BASE;
+            const { data: prs } = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              state: 'open',
+              head,
+              base
+            });
+            if (prs.length > 0) {
+              const pr = prs[0];
+              core.info(`PR already exists: #${pr.number} (${pr.html_url})`);
+              core.setOutput('exists', 'true');
+              core.setOutput('number', String(pr.number));
+              core.setOutput('url', pr.html_url);
+            } else {
+              core.setOutput('exists', 'false');
+            }
+
+      # 6) Create the PR if none exists
+      - name: Create PR dup_feature -> base
+        id: createpr
+        if: steps.findpr.outputs.exists != 'true'
+        uses: actions/github-script@v7
+        env:
+          DUP_BRANCH: ${{ steps.vars.outputs.dup_branch }}
+          BASE: ${{ steps.inp.outputs.base }}
+          FEATURE: ${{ steps.inp.outputs.branch }}
+          WI: ${{ steps.inp.outputs.workItemId }}
+          JIRA: ${{ steps.inp.outputs.jiraUrl }}
+          DETAILS: ${{ steps.inp.outputs.details }}
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo  = context.repo.repo;
+            const dup   = process.env.DUP_BRANCH;
+            const base  = process.env.BASE;
+
+            const title = `PR: ${dup} -> ${base}`;
+            const body  = [
+              'Triggered by Salesforce',
+              `Feature branch: ${process.env.FEATURE}`,
+              `Duplicate branch: ${dup}`,
+              `Base branch: ${base}`,
+              process.env.WI ? `WorkItem: ${process.env.WI}` : '',
+              process.env.JIRA ? `Jira: ${process.env.JIRA}` : '',
+              process.env.DETAILS ? `Details: ${process.env.DETAILS}` : ''
+            ].filter(Boolean).join('\n');
+
+            const { data: pr } = await github.rest.pulls.create({
+              owner, repo, title, head: dup, base, body
+            });
+            core.info(`Created PR #${pr.number}: ${pr.html_url}`);
+            core.setOutput('number', String(pr.number));
+            core.setOutput('url', pr.html_url);
+
+      # 7) Final log
+      - name: PR info
+        run: |
+          if [ "${{ steps.findpr.outputs.exists }}" = "true" ]; then
+            echo "Existing PR #${{ steps.findpr.outputs.number }} -> ${{ steps.findpr.outputs.url }}"
+          else
+            echo "New PR #${{ steps.createpr.outputs.number }} -> ${{
+              steps.createpr.outputs.url }}"
+          fi
