@@ -2,73 +2,131 @@
 name: Create PR to QA (duplicate feature branch)
 
 on:
-  # This listens to the dispatch your Apex is sending:
-  # event_type: salesforce_pr_to_qa
+  # Salesforce dispatch: event_type must match this
   repository_dispatch:
     types: [salesforce_pr_to_qa]
 
-# The workflow needs to push a branch and open a PR:
+  # Optional manual trigger for testing
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Feature branch to duplicate (e.g., feature/abc-123)'
+        required: true
+      baseRef:
+        description: 'Base branch for PR'
+        required: false
+        default: 'qa'
+      workItemId:
+        description: 'Salesforce WorkItem Id'
+        required: false
+      jiraUrl:
+        description: 'Jira URL'
+        required: false
+      details:
+        description: 'Work item details'
+        required: false
+
 permissions:
-  contents: write         # to create/push branches
-  pull-requests: write    # to create PRs
+  contents: write
+  pull-requests: write
 
 jobs:
   duplicate-and-pr:
     runs-on: ubuntu-latest
 
     steps:
-      # 1) Checkout the source (feature) branch
-      - name: Checkout feature branch
+      # 1) Resolve inputs (from dispatch payload or manual inputs)
+      - name: Resolve inputs
+        id: inp
+        shell: bash
+        run: |
+          BRANCH="${{ github.event.client_payload.branch || inputs.branch }}"
+          BASE="${{ github.event.client_payload.baseRef || inputs.baseRef || 'qa' }}"
+          WI="${{ github.event.client_payload.workItemId || inputs.workItemId }}"
+          JIRA="${{ github.event.client_payload.jiraUrl || inputs.jiraUrl }}"
+          DETAILS="${{ github.event.client_payload.details || inputs.details }}"
+          if [ -z "$BRANCH" ]; then
+            echo "Feature branch is required." >&2
+            exit 1
+          fi
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
+          echo "workItemId=$WI" >> "$GITHUB_OUTPUT"
+          echo "jiraUrl=$JIRA" >> "$GITHUB_OUTPUT"
+          echo "details=$DETAILS" >> "$GITHUB_OUTPUT"
+          echo "Inputs: branch=$BRANCH base=$BASE WI=$WI"
+
+      # 2) Checkout repo (default branch); we'll fetch specific refs ourselves
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.client_payload.branch }}
           fetch-depth: 0
 
-      # 2) Compute a safe duplicate branch name: dup_feature/<feature-branch-slug>
+      # 3) Verify remote branches exist; fetch origin/<feature>
+      - name: Verify & fetch remote feature/base branches
+        shell: bash
+        run: |
+          set -euxo pipefail
+          FEATURE="${{ steps.inp.outputs.branch }}"
+          BASE="${{ steps.inp.outputs.base }}"
+
+          # Verify feature exists remotely
+          git ls-remote --exit-code --heads origin "$FEATURE"
+
+          # Verify base exists remotely
+          git ls-remote --exit-code --heads origin "$BASE"
+
+          # Fetch just the feature branch tip to ensure we have the right commit
+          git fetch --no-tags --prune origin "$FEATURE":"refs/remotes/origin/$FEATURE"
+
+      # 4) Compute duplicate branch name (keep structure, replace slashes)
       - name: Compute dup branch name
         id: vars
         shell: bash
         run: |
-          FEATURE="${{ github.event.client_payload.branch }}"
-          BASE="${{ github.event.client_payload.baseRef || 'qa' }}"
-          SHORT="${FEATURE##*/}"                                   # take last path segment (feature/abc-123 -> abc-123)
-          SAFE=$(echo "$SHORT" | tr -cd '[:alnum:]-_' | tr '[:upper:]' '[:lower:]' | cut -c1-64)
+          FEATURE="${{ steps.inp.outputs.branch }}"
+          # Replace slashes to avoid path ambiguity, and lowercase
+          SAFE=$(echo "$FEATURE" | tr '/' '-' | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]-_' | cut -c1-64)
           DUP="dup_feature/${SAFE}"
           echo "dup_branch=$DUP" >> "$GITHUB_OUTPUT"
-          echo "base=$BASE" >> "$GITHUB_OUTPUT"
-          echo "Computed duplicate branch: $DUP; base: $BASE"
+          echo "Duplicate branch: $DUP from $FEATURE"
 
-      # 3) Create and push the duplicate branch
-      - name: Create and push dup_branch
+      # 5) Create duplicate branch from origin/<feature> commit and push
+      - name: Create and push duplicate branch
         env:
+          FEATURE: ${{ steps.inp.outputs.branch }}
           DUP_BRANCH: ${{ steps.vars.outputs.dup_branch }}
+          WI: ${{ steps.inp.outputs.workItemId }}
+          JIRA: ${{ steps.inp.outputs.jiraUrl }}
+          DETAILS: ${{ steps.inp.outputs.details }}
+        shell: bash
         run: |
+          set -euxo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "actions@users.noreply.github.com"
 
-          # Create the dup branch from the currently checked-out feature branch
-          git checkout -B "$DUP_BRANCH"
+          # Create dup branch pointing at remote feature tip
+          git checkout -B "$DUP_BRANCH" "origin/$FEATURE"
 
-          # Optional marker commit (helps ensure push works even if branch would otherwise be identical)
-          echo "Source branch: ${{ github.event.client_payload.branch }}" > DUP_INFO.md
-          echo "WorkItem: ${{ github.event.client_payload.workItemId }}" >> DUP_INFO.md
-          echo "Jira: ${{ github.event.client_payload.jiraUrl }}" >> DUP_INFO.md
-          echo "Details: ${{ github.event.client_payload.details }}" >> DUP_INFO.md
+          # Optional marker file so push always has a ref update
+          echo "Source: $FEATURE" > DUP_INFO.md
+          [ -n "$WI" ] && echo "WorkItem: $WI" >> DUP_INFO.md
+          [ -n "$JIRA" ] && echo "Jira: $JIRA" >> DUP_INFO.md
+          [ -n "$DETAILS" ] && echo "Details: $DETAILS" >> DUP_INFO.md
+
           git add DUP_INFO.md || true
-          git commit -m "chore: create duplicate branch $DUP_BRANCH" || echo "No changes to commit (branch may already exist)"
+          git commit -m "chore: duplicate $FEATURE -> $DUP_BRANCH" || true
 
-          # Push the duplicate branch
+          # Push dup branch (create/update on origin)
           git push -u origin "$DUP_BRANCH"
 
-      # 4) Ensure base branch (qa) exists locally
-      - name: Ensure base exists
-        run: |
-          git fetch origin ${{ steps.vars.outputs.base }}
-
-      # 5) Check for an existing PR (avoid duplicates)
-      - name: Find existing PR
+      # 6) Check for existing PR (avoid duplicates)
+      - name: Find existing PR dup_feature -> base
         id: findpr
         uses: actions/github-script@v7
+        env:
+          DUP_BRANCH: ${{ steps.vars.outputs.dup_branch }}
+          BASE: ${{ steps.inp.outputs.base }}
         with:
           script: |
             const head = `${context.repo.owner}:${process.env.DUP_BRANCH}`;
@@ -81,20 +139,27 @@ jobs:
               base
             });
             if (prs.length > 0) {
-              core.info(`PR already exists: #${prs[0].number} (${prs[0].html_url})`);
+              const pr = prs[0];
+              core.info(`PR already exists: #${pr.number} (${pr.html_url})`);
               core.setOutput('exists', 'true');
-              core.setOutput('number', prs[0].number.toString());
+              core.setOutput('number', String(pr.number));
+              core.setOutput('url', pr.html_url);
             } else {
               core.setOutput('exists', 'false');
             }
-          env:
-            DUP_BRANCH: ${{ steps.vars.outputs.dup_branch }}
-            BASE: ${{ steps.vars.outputs.base }}
 
-      # 6) Create the PR if one doesn't already exist
+      # 7) Create the PR if not exists
       - name: Create PR dup_feature -> base
+        id: createpr
         if: steps.findpr.outputs.exists != 'true'
         uses: actions/github-script@v7
+        env:
+          DUP_BRANCH: ${{ steps.vars.outputs.dup_branch }}
+          BASE: ${{ steps.inp.outputs.base }}
+          FEATURE: ${{ steps.inp.outputs.branch }}
+          WI: ${{ steps.inp.outputs.workItemId }}
+          JIRA: ${{ steps.inp.outputs.jiraUrl }}
+          DETAILS: ${{ steps.inp.outputs.details }}
         with:
           script: |
             const dup  = process.env.DUP_BRANCH;
@@ -102,30 +167,33 @@ jobs:
             const title = `PR: ${dup} -> ${base}`;
             const body  = [
               `Triggered by Salesforce`,
-              `Feature branch: ${{ github.event.client_payload.branch }}`,
+              `Feature branch: ${process.env.FEATURE}`,
               `Duplicate branch: ${dup}`,
               `Base branch: ${base}`,
-              `WorkItem: ${{ github.event.client_payload.workItemId }}`,
-              `Jira: ${{ github.event.client_payload.jiraUrl }}`,
-              `Details: ${{ github.event.client_payload.details }}`
-            ].join('\n');
+              process.env.WI ? `WorkItem: ${process.env.WI}` : '',
+              process.env.JIRA ? `Jira: ${process.env.JIRA}` : '',
+              process.env.DETAILS ? `Details: ${process.env.DETAILS}` : ''
+            ].filter(Boolean).join('\n');
 
-            // Create PR via REST API (POST /repos/{owner}/{repo}/pulls)
             const { data: pr } = await github.rest.pulls.create({
               owner: context.repo.owner,
               repo:  context.repo.repo,
               title,
-              head:  dup,   // source
-              base:  base,  // target
+              head:  dup,
+              base:  base,
               body
             });
             core.info(`Created PR #${pr.number}: ${pr.html_url}`);
-          env:
-            DUP_BRANCH: ${{ steps.vars.outputs.dup_branch }}
-            BASE: ${{ steps.vars.outputs.base }}
+            core.setOutput('number', String(pr.number));
+            core.setOutput('url', pr.html_url);
 
-      # 7) Output existing PR details (if found)
-      - name: Existing PR
-        if: steps.findpr.outputs.exists == 'true'
+      # 8) Log final PR information
+      - name: PR info
         run: |
-          echo "Existing PR #${{ steps.findpr.outputs.number }} for ${{ steps.vars.outputs.dup_branch }} -> ${{ steps.vars.outputs.base }}"
+          if [ "${{ steps.findpr.outputs.exists }}" = "true" ]; then
+            echo "Existing PR #${{ steps.findpr.outputs.number }} -> ${{
+              steps.findpr.outputs.url }}"
+          else
+            echo "New PR #${{ steps.createpr.outputs.number }} -> ${{
+              steps.createpr.outputs.url }}"
+          fi
