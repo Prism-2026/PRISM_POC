@@ -203,55 +203,87 @@ jobs:
           else
             echo "New PR #${{ steps.createpr.outputs.number }} -> ${{ steps.createpr.outputs.url }}"
           fi
+      # 8) Read JWT Token
+      
+- name: Get Salesforce OAuth token (JWT Bearer)
+  shell: bash
+  env:
+    SF_CONSUMER_KEY: ${{ secrets.SF_CONSUMER_KEY }}
+    SF_USERNAME:     ${{ secrets.SF_USERNAME }}
+    SF_LOGIN_URL:    ${{ secrets.SF_LOGIN_URL }}
+    SF_PRIVATE_KEY:  ${{ secrets.SF_PRIVATE_KEY }}
+  run: |
+    set -euo pipefail
+    echo "$SF_PRIVATE_KEY" > /tmp/sf_private_key.pem
 
-      # 8) Call Back
-      - name: Callback to Salesforce (create/update Pull_Request__c)
-        if: ${{ success() }}
-        shell: bash
-        env:
-          SF_BASE_URL:        ${{ secrets.SF_BASE_URL }}         # e.g., https://yourdomain.my.salesforce.com
-          SF_CALLBACK_SECRET: ${{ secrets.SF_CALLBACK_SECRET }}  # same as Custom Label value
-          WI:                 ${{ steps.inp.outputs.workItemId }}
-          DUP:                ${{ steps.vars.outputs.dup_branch }}
-          BASE:               ${{ steps.inp.outputs.base }}
-          PR_URL:             ${{ steps.findpr.outputs.url || steps.createpr.outputs.url }}
-          PR_NUM:             ${{ steps.findpr.outputs.number || steps.createpr.outputs.number }}
-        run: |
-          if [[ -z "$PR_URL" || -z "$PR_NUM" ]]; then
-            echo "No PR URL/Number found; skipping Salesforce callback." >&2
-            exit 0
-          fi
+    ISS="$SF_CONSUMER_KEY"
+    SUB="$SF_USERNAME"
+    AUD="$SF_LOGIN_URL"
+    NOW=$(date +%s)
+    EXP=$((NOW+300))
 
-          # Prepare JSON body (head/source is the duplicate branch we used to open the PR)
-          BODY=$(jq -n \
-            --arg wi  "$WI" \
-            --arg src "$DUP" \
-            --arg tgt "$BASE" \
-            --arg num "$PR_NUM" \
-            --arg url "$PR_URL" \
-            --arg stat "Open" \
-            --arg dup "$DUP" \
-            '{
-              workItemId: $wi,
-              sourceBranch: $src,
-              targetBranch: $tgt,
-              prNumber: $num,
-              prUrl: $url,
-              status: $stat,
-              duplicateBranch: $dup
-            }')
+    HEADER=$(jq -nc --arg alg RS256 --arg typ JWT '{alg:$alg,typ:$typ}')
+    CLAIMS=$(jq -nc --arg iss "$ISS" --arg sub "$SUB" --arg aud "$AUD" --argjson iat "$NOW" --argjson exp "$EXP" '{iss:$iss,sub:$sub,aud:$aud,iat:$iat,exp:$exp}')
 
-          echo "Posting callback to Salesforce..."
-          HTTP_CODE=$(curl -sS -o /tmp/sf_resp.json -w '%{http_code}' \
-            -X POST "$SF_BASE_URL/services/apexrest/github/pr-callback" \
-            -H "Authorization: Bearer $SF_CALLBACK_SECRET" \
-            -H "Content-Type: application/json" \
-            --data "$BODY")
+    B64HDR=$(echo -n "$HEADER" | openssl base64 -A | tr '+/' '-_' | tr -d '=')
+    B64CLM=$(echo -n "$CLAIMS" | openssl base64 -A | tr '+/' '-_' | tr -d '=')
+    SIG=$(printf "%s.%s" "$B64HDR" "$B64CLM" | openssl dgst -sha256 -sign /tmp/sf_private_key.pem | openssl base64 -A | tr '+/' '-_' | tr -d '=')
+    JWT="$B64HDR.$B64CLM.$SIG"
 
-          echo "Salesforce response code: $HTTP_CODE"
-          cat /tmp/sf_resp.json || true
+    RESP=$(curl -sS "$SF_LOGIN_URL/services/oauth2/token" \
+      -d grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer \
+      --data-urlencode assertion="$JWT")
 
-          if [[ "$HTTP_CODE" -lt 200 || "$HTTP_CODE" -ge 300 ]]; then
-            echo "Salesforce callback failed with HTTP $HTTP_CODE" >&2
-            exit 1
-          fi
+    ACCESS_TOKEN=$(echo "$RESP" | jq -r '.access_token')
+    INSTANCE_URL=$(echo "$RESP" | jq -r '.instance_url')
+
+    if [ -z "$ACCESS_TOKEN" ] || [ -z "$INSTANCE_URL" ] || [ "$ACCESS_TOKEN" = "null" ] || [ "$INSTANCE_URL" = "null" ]; then
+      echo "Failed to obtain Salesforce token: $RESP" >&2
+      exit 1
+    fi
+
+    echo "ACCESS_TOKEN=$ACCESS_TOKEN" >> $GITHUB_ENV
+    echo "INSTANCE_URL=$INSTANCE_URL" >> $GITHUB_ENV
+
+      # 9) Call Back
+     
+- name: Callback to Salesforce (create/update Pull_Request__c)
+  shell: bash
+  env:
+    ACCESS_TOKEN: ${{ env.ACCESS_TOKEN }}
+    INSTANCE_URL: ${{ env.INSTANCE_URL }}
+    WI:           ${{ steps.inp.outputs.workItemId }}
+    DUP:          ${{ steps.vars.outputs.dup_branch }}
+    BASE:         ${{ steps.inp.outputs.base }}
+    PR_URL:       ${{ steps.findpr.outputs.url || steps.createpr.outputs.url }}
+    PR_NUM:       ${{ steps.findpr.outputs.number || steps.createpr.outputs.number }}
+  run: |
+    set -euo pipefail
+    if [[ -z "$PR_URL" || -z "$PR_NUM" ]]; then
+      echo "No PR URL/Number found; skipping Salesforce callback." >&2
+      exit 0
+    fi
+
+    BODY=$(jq -n \
+      --arg wi  "$WI" \
+      --arg src "$DUP" \
+      --arg tgt "$BASE" \
+      --arg num "$PR_NUM" \
+      --arg url "$PR_URL" \
+      --arg stat "Open" \
+      --arg dup "$DUP" \
+      '{workItemId:$wi,sourceBranch:$src,targetBranch:$tgt,prNumber:$num,prUrl:$url,status:$stat,duplicateBranch:$dup}')
+
+    HTTP_CODE=$(curl -sS -o /tmp/sf_resp.json -w '%{http_code}' \
+      -X POST "$INSTANCE_URL/services/apexrest/github/pr-callback" \
+      -H "Authorization: Bearer $ACCESS_TOKEN" \
+      -H "Content-Type: application/json" \
+      --data "$BODY")
+
+    echo "Salesforce response code: $HTTP_CODE"
+    sed -n '1,200p' /tmp/sf_resp.json || true
+
+    if [[ "$HTTP_CODE" -lt 200 || "$HTTP_CODE" -ge 300 ]]; then
+      echo "Salesforce callback failed with HTTP $HTTP_CODE" >&2
+      exit 1
+    fi
