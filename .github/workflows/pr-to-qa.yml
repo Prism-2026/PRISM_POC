@@ -221,8 +221,8 @@ jobs:
           FEATURE:           ${{ steps.inp.outputs.branch }}
           DUP:               ${{ steps.vars.outputs.dup_branch }}
           BASE:              ${{ steps.inp.outputs.base }}
-          PR_URL:            ${{ steps.result.outputs.pr_url }}
-          PR_NUM:            ${{ steps.result.outputs.pr_number }}
+          PR_URL:            ${{ pr.html_url }}
+          PR_NUM:            ${{ pr.number }}
         run: |
           if [ -z "$PR_URL" ] || [ -z "$PR_NUM" ]; then
             echo "No PR URL/Number found; skipping Salesforce callback." >&2
