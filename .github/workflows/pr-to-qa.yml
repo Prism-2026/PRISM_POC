@@ -2,10 +2,8 @@
 name: Create PR to QA (duplicate feature branch via REST)
 
 on:
-  # Apex dispatches this exact event_type
   repository_dispatch:
     types: [salesforce_pr_to_qa]
-  # Optional: manual trigger for testing from Actions tab
   workflow_dispatch:
     inputs:
       branch:
@@ -25,7 +23,6 @@ on:
         description: 'Work item details'
         required: false
 
-# Needed to create branch refs and open PRs with the job's GITHUB_TOKEN
 permissions:
   contents: write
   pull-requests: write
@@ -38,16 +35,14 @@ jobs:
       cancel-in-progress: false
 
     steps:
-      # 1) Resolve inputs (supports both repository_dispatch and workflow_dispatch)
+      # 1) Resolve inputs and validate source pattern feature/*
       - name: Resolve inputs
         id: inp
         shell: bash
         run: |
           set -euo pipefail
-          # Accept branch from either repository_dispatch or workflow_dispatch
           BRANCH="${{ github.event.client_payload.branch || inputs.branch }}"
-
-          # Normalize common prefixes (e.g., refs/heads/feature/abc-123 -> feature/abc-123)
+          # Normalize refs/heads/* prefix if present
           BRANCH="${BRANCH#refs/heads/}"
 
           # Enforce the required pattern: feature/*
@@ -66,29 +61,46 @@ jobs:
           JIRA="${{ github.event.client_payload.jiraUrl || inputs.jiraUrl }}"
           DETAILS="${{ github.event.client_payload.details || inputs.details }}"
 
-          echo "branch=${BRANCH}" >> "$GITHUB_OUTPUT"
-          echo "base=${BASE}" >> "$GITHUB_OUTPUT"
-          echo "workItemId=${WI}" >> "$GITHUB_OUTPUT"
-          echo "jiraUrl=${JIRA}" >> "$GITHUB_OUTPUT"
+          echo "branch=${BRANCH}"   >> "$GITHUB_OUTPUT"
+          echo "base=${BASE}"       >> "$GITHUB_OUTPUT"
+          echo "workItemId=${WI}"   >> "$GITHUB_OUTPUT"
+          echo "jiraUrl=${JIRA}"    >> "$GITHUB_OUTPUT"
           echo "details=${DETAILS}" >> "$GITHUB_OUTPUT"
 
-      # 2) Compute safe duplicate branch name (slug of feature tail)
+      # 2) Compute dup_feature/* safely from tail of feature/*
       - name: Compute dup branch name
         id: vars
         shell: bash
         run: |
           set -euo pipefail
           FEATURE="${{ steps.inp.outputs.branch }}"
-          TAIL="${FEATURE##*/}" # e.g., feature/abc-123 -> abc-123
-          SAFE=$(echo "$TAIL" \
-            tr -cd '[:alnum:]-_' \
-            tr '[:upper:]' '[:lower:]' \
-            cut -c1-64)
+          TAIL="${FEATURE##*/}"  # feature/abc-123 -> abc-123
+
+          # Build a safe slug for Git ref:
+          # - keep only a-z 0-9 - _
+          # - lowercase
+          # - collapse multiple dashes/underscores
+          # - trim leading/trailing dashes/underscores
+          # - fallback to 'unnamed' if empty
+          SAFE="$(echo "$TAIL" \
+            | tr '[:upper:]' '[:lower:]' \
+            | tr -cd '[:alnum:]-_' \
+            | sed -E 's/[-_]+/-/g' \
+            | sed -E 's/^[-_]+//; s/[-_]+$//' \
+          )"
+
+          if [[ -z "$SAFE" ]]; then
+            SAFE="unnamed"
+          fi
+
+          # Limit to 64 chars to avoid overly long refs
+          SAFE="${SAFE:0:64}"
+
           DUP="dup_feature/${SAFE}"
           echo "dup_branch=${DUP}" >> "$GITHUB_OUTPUT"
           echo "Duplicate branch will be: ${DUP}"
 
-      # 3) Create duplicate branch via REST (points to the feature branch SHA)
+      # 3) Create duplicate branch via REST (points at feature/* SHA)
       - name: Create duplicate branch ref (or confirm it exists)
         id: createref
         uses: actions/github-script@v7
@@ -99,34 +111,34 @@ jobs:
           script: |
             const owner = context.repo.owner;
             const repo = context.repo.repo;
-            // Ensure we use refs/heads/* for Git refs API
-            const featureHeadsRef = `heads/${process.env.FEATURE}`;
-            const dupFullRef = `refs/heads/${process.env.DUP}`;
 
-            // 1) Get feature ref & SHA
-            const featureRef = await github.rest.git.getRef({ owner, repo, ref: featureHeadsRef });
-            const sha = featureRef.data.object.sha;
-            core.info(`Feature ref: ${featureRef.data.ref} -> ${sha}`);
+            const featureRef = `heads/${process.env.FEATURE}`;
+            const dupRefFull = `refs/heads/${process.env.DUP}`;
 
-            // 2) Try to get dup ref; if present, skip creation
+            // Get source SHA from feature/*
+            const featureHeads = await github.rest.git.getRef({ owner, repo, ref: featureRef });
+            const sha = featureHeads.data.object.sha;
+            core.info(`Feature ref: ${featureHeads.data.ref} -> ${sha}`);
+
+            // Check if dup_feature/* exists
             let dupExists = false;
             try {
-              const existingDup = await github.rest.git.getRef({ owner, repo, ref: `heads/${process.env.DUP}` });
-              dupExists = !!existingDup?.data?.ref;
-              core.info(`Duplicate branch already exists: ${existingDup.data.ref}`);
+              const dupHeads = await github.rest.git.getRef({ owner, repo, ref: `heads/${process.env.DUP}` });
+              dupExists = !!dupHeads?.data?.ref;
+              core.info(`Duplicate branch already exists: ${dupHeads.data.ref}`);
               core.setOutput('dup_exists', 'true');
-            } catch (err) {
+            } catch {
               core.info(`Duplicate branch does not exist yet; will create it.`);
               core.setOutput('dup_exists', 'false');
             }
 
-            // 3) Create duplicate ref if it doesn't exist
+            // Create if missing
             if (!dupExists) {
-              await github.rest.git.createRef({ owner, repo, ref: dupFullRef, sha });
-              core.info(`Created duplicate branch ref: ${dupFullRef} -> ${sha}`);
+              await github.rest.git.createRef({ owner, repo, ref: dupRefFull, sha });
+              core.info(`Created duplicate branch ref: ${dupRefFull} -> ${sha}`);
             }
 
-      # 4) Verify base branch exists (QA), fail early if missing
+      # 4) Verify base branch exists
       - name: Verify base branch exists (QA)
         uses: actions/github-script@v7
         env:
@@ -143,7 +155,7 @@ jobs:
               core.setFailed(`Base branch '${base}' not found on origin.`);
             }
 
-      # 5) Find existing PR dup_feature -> base (avoid duplicates)
+      # 5) Find existing PR dup_feature/* -> base (avoid duplicates)
       - name: Find existing PR dup_feature -> base
         id: findpr
         uses: actions/github-script@v7
@@ -156,6 +168,7 @@ jobs:
             const repo = context.repo.repo;
             const head = `${owner}:${process.env.DUP_BRANCH}`;
             const base = process.env.BASE;
+
             const { data: prs } = await github.rest.pulls.list({ owner, repo, state: 'open', head, base });
             if (prs.length > 0) {
               const pr = prs[0];
@@ -183,6 +196,7 @@ jobs:
           script: |
             const owner = context.repo.owner;
             const repo = context.repo.repo;
+
             const dup = process.env.DUP_BRANCH;
             const base = process.env.BASE;
             const title = `PR: ${dup} -> ${base}`;
@@ -203,7 +217,7 @@ jobs:
             core.setOutput('number', String(pr.number));
             core.setOutput('url', pr.html_url);
 
-      # 7) PR info (fix: export FEATURE + PR vars for downstream steps)
+      # 7) Export PR info for downstream steps (and FEATURE)
       - name: PR info
         shell: bash
         run: |
@@ -217,12 +231,9 @@ jobs:
             PR_NUM="${{ steps.createpr.outputs.number }}"
             echo "New PR #${PR_NUM} -> ${PR_URL}"
           fi
-          # Export FEATURE as well for downstream steps (Salesforce callback)
           echo "FEATURE=${{ steps.inp.outputs.branch }}" >> "$GITHUB_ENV"
-          # Export for subsequent steps
           echo "PR_URL=${PR_URL}" >> "$GITHUB_ENV"
           echo "PR_NUM=${PR_NUM}" >> "$GITHUB_ENV"
-          # Summarize
           {
             echo "### QA PR"
             echo "- URL: ${PR_URL}"
@@ -235,9 +246,9 @@ jobs:
         shell: bash
         env:
           SF_CONSUMER_KEY: ${{ secrets.SF_CONSUMER_KEY }}
-          SF_USERNAME: ${{ secrets.SF_USERNAME }}
-          SF_LOGIN_URL: ${{ secrets.SF_LOGIN_URL }}
-          SF_PRIVATE_KEY: ${{ secrets.SF_PRIVATE_KEY }}
+          SF_USERNAME:     ${{ secrets.SF_USERNAME }}
+          SF_LOGIN_URL:    ${{ secrets.SF_LOGIN_URL }}
+          SF_PRIVATE_KEY:  ${{ secrets.SF_PRIVATE_KEY }}
         run: |
           set -euo pipefail
           if [[ -z "${SF_CONSUMER_KEY}" || -z "${SF_USERNAME}" || -z "${SF_LOGIN_URL}" || -z "${SF_PRIVATE_KEY}" ]]; then
@@ -280,12 +291,12 @@ jobs:
         env:
           ACCESS_TOKEN: ${{ env.ACCESS_TOKEN }}
           INSTANCE_URL: ${{ env.INSTANCE_URL }}
-          WI: ${{ steps.inp.outputs.workItemId }}
+          WI:      ${{ steps.inp.outputs.workItemId }}
           FEATURE: ${{ env.FEATURE }}
-          DUP: ${{ steps.vars.outputs.dup_branch }}
-          BASE: ${{ steps.inp.outputs.base }}
-          PR_URL: ${{ env.PR_URL }}
-          PR_NUM: ${{ env.PR_NUM }}
+          DUP:     ${{ steps.vars.outputs.dup_branch }}
+          BASE:    ${{ steps.inp.outputs.base }}
+          PR_URL:  ${{ env.PR_URL }}
+          PR_NUM:  ${{ env.PR_NUM }}
         run: |
           set -euo pipefail
           if [[ -z "$PR_URL" || -z "$PR_NUM" ]]; then
