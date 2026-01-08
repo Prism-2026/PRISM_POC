@@ -5,7 +5,6 @@ on:
   # Apex dispatches this exact event_type
   repository_dispatch:
     types: [salesforce_pr_to_qa]
-
   # Optional: manual trigger for testing from Actions tab
   workflow_dispatch:
     inputs:
@@ -34,7 +33,6 @@ permissions:
 jobs:
   duplicate-and-pr:
     runs-on: ubuntu-latest
-
     concurrency:
       group: pr-to-qa-${{ github.event.client_payload.branch || inputs.branch }}
       cancel-in-progress: false
@@ -46,23 +44,33 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
+          # Accept branch from either repository_dispatch or workflow_dispatch
           BRANCH="${{ github.event.client_payload.branch || inputs.branch }}"
+
+          # Normalize common prefixes (e.g., refs/heads/feature/abc-123 -> feature/abc-123)
+          BRANCH="${BRANCH#refs/heads/}"
+
+          # Enforce the required pattern: feature/*
+          if [[ -z "${BRANCH}" ]]; then
+            echo "Feature branch is required." >&2
+            exit 1
+          fi
+          if [[ "${BRANCH}" != feature/* ]]; then
+            echo "Invalid source branch '${BRANCH}'. Expected pattern: feature/*" >&2
+            echo "Tip: provide e.g. 'feature/abc-123'." >&2
+            exit 1
+          fi
+
           BASE="${{ github.event.client_payload.baseRef || inputs.baseRef || 'qa' }}"
           WI="${{ github.event.client_payload.workItemId || inputs.workItemId }}"
           JIRA="${{ github.event.client_payload.jiraUrl || inputs.jiraUrl }}"
           DETAILS="${{ github.event.client_payload.details || inputs.details }}"
 
-          if [ -z "$BRANCH" ]; then
-            echo "Feature branch is required." >&2
-            exit 1
-          fi
-
-          echo "branch=$BRANCH"       >> "$GITHUB_OUTPUT"
-          echo "base=$BASE"           >> "$GITHUB_OUTPUT"
-          echo "workItemId=$WI"       >> "$GITHUB_OUTPUT"
-          echo "jiraUrl=$JIRA"        >> "$GITHUB_OUTPUT"
-          echo "details=$DETAILS"     >> "$GITHUB_OUTPUT"
+          echo "branch=${BRANCH}" >> "$GITHUB_OUTPUT"
+          echo "base=${BASE}" >> "$GITHUB_OUTPUT"
+          echo "workItemId=${WI}" >> "$GITHUB_OUTPUT"
+          echo "jiraUrl=${JIRA}" >> "$GITHUB_OUTPUT"
+          echo "details=${DETAILS}" >> "$GITHUB_OUTPUT"
 
       # 2) Compute safe duplicate branch name (slug of feature tail)
       - name: Compute dup branch name
@@ -70,13 +78,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           FEATURE="${{ steps.inp.outputs.branch }}"
-          TAIL="${FEATURE##*/}"   # e.g., feature/abc-123 -> abc-123
-          SAFE=$(echo "$TAIL" | tr -cd '[:alnum:]-_' | tr '[:upper:]' '[:lower:]' | cut -c1-64)
+          TAIL="${FEATURE##*/}" # e.g., feature/abc-123 -> abc-123
+          SAFE=$(echo "$TAIL" \
+            tr -cd '[:alnum:]-_' \
+            tr '[:upper:]' '[:lower:]' \
+            cut -c1-64)
           DUP="dup_feature/${SAFE}"
-          echo "dup_branch=$DUP" >> "$GITHUB_OUTPUT"
-          echo "Duplicate branch will be: $DUP"
+          echo "dup_branch=${DUP}" >> "$GITHUB_OUTPUT"
+          echo "Duplicate branch will be: ${DUP}"
 
       # 3) Create duplicate branch via REST (points to the feature branch SHA)
       - name: Create duplicate branch ref (or confirm it exists)
@@ -84,15 +94,14 @@ jobs:
         uses: actions/github-script@v7
         env:
           FEATURE: ${{ steps.inp.outputs.branch }}
-          DUP:     ${{ steps.vars.outputs.dup_branch }}
+          DUP: ${{ steps.vars.outputs.dup_branch }}
         with:
           script: |
             const owner = context.repo.owner;
-            const repo  = context.repo.repo;
-
+            const repo = context.repo.repo;
             // Ensure we use refs/heads/* for Git refs API
             const featureHeadsRef = `heads/${process.env.FEATURE}`;
-            const dupFullRef      = `refs/heads/${process.env.DUP}`;
+            const dupFullRef = `refs/heads/${process.env.DUP}`;
 
             // 1) Get feature ref & SHA
             const featureRef = await github.rest.git.getRef({ owner, repo, ref: featureHeadsRef });
@@ -125,8 +134,8 @@ jobs:
         with:
           script: |
             const owner = context.repo.owner;
-            const repo  = context.repo.repo;
-            const base  = process.env.BASE;
+            const repo = context.repo.repo;
+            const base = process.env.BASE;
             try {
               const baseRef = await github.rest.git.getRef({ owner, repo, ref: `heads/${base}` });
               core.info(`Base branch found: ${baseRef.data.ref}`);
@@ -140,14 +149,13 @@ jobs:
         uses: actions/github-script@v7
         env:
           DUP_BRANCH: ${{ steps.vars.outputs.dup_branch }}
-          BASE:       ${{ steps.inp.outputs.base }}
+          BASE: ${{ steps.inp.outputs.base }}
         with:
           script: |
             const owner = context.repo.owner;
-            const repo  = context.repo.repo;
-            const head  = `${owner}:${process.env.DUP_BRANCH}`;
-            const base  = process.env.BASE;
-
+            const repo = context.repo.repo;
+            const head = `${owner}:${process.env.DUP_BRANCH}`;
+            const base = process.env.BASE;
             const { data: prs } = await github.rest.pulls.list({ owner, repo, state: 'open', head, base });
             if (prs.length > 0) {
               const pr = prs[0];
@@ -166,20 +174,19 @@ jobs:
         uses: actions/github-script@v7
         env:
           DUP_BRANCH: ${{ steps.vars.outputs.dup_branch }}
-          BASE:       ${{ steps.inp.outputs.base }}
-          FEATURE:    ${{ steps.inp.outputs.branch }}
-          WI:         ${{ steps.inp.outputs.workItemId }}
-          JIRA:       ${{ steps.inp.outputs.jiraUrl }}
-          DETAILS:    ${{ steps.inp.outputs.details }}
+          BASE: ${{ steps.inp.outputs.base }}
+          FEATURE: ${{ steps.inp.outputs.branch }}
+          WI: ${{ steps.inp.outputs.workItemId }}
+          JIRA: ${{ steps.inp.outputs.jiraUrl }}
+          DETAILS: ${{ steps.inp.outputs.details }}
         with:
           script: |
             const owner = context.repo.owner;
-            const repo  = context.repo.repo;
-            const dup   = process.env.DUP_BRANCH;
-            const base  = process.env.BASE;
-
+            const repo = context.repo.repo;
+            const dup = process.env.DUP_BRANCH;
+            const base = process.env.BASE;
             const title = `PR: ${dup} -> ${base}`;
-            const body  = [
+            const body = [
               'Triggered by Salesforce',
               `Feature branch: ${process.env.FEATURE}`,
               `Duplicate branch: ${dup}`,
@@ -196,12 +203,11 @@ jobs:
             core.setOutput('number', String(pr.number));
             core.setOutput('url', pr.html_url);
 
-      # 7) PR info (fix: set local vars first, then export to GITHUB_ENV)
+      # 7) PR info (fix: export FEATURE + PR vars for downstream steps)
       - name: PR info
         shell: bash
         run: |
           set -euo pipefail
-
           if [ "${{ steps.findpr.outputs.exists }}" = "true" ]; then
             PR_URL="${{ steps.findpr.outputs.url }}"
             PR_NUM="${{ steps.findpr.outputs.number }}"
@@ -211,11 +217,11 @@ jobs:
             PR_NUM="${{ steps.createpr.outputs.number }}"
             echo "New PR #${PR_NUM} -> ${PR_URL}"
           fi
-
+          # Export FEATURE as well for downstream steps (Salesforce callback)
+          echo "FEATURE=${{ steps.inp.outputs.branch }}" >> "$GITHUB_ENV"
           # Export for subsequent steps
           echo "PR_URL=${PR_URL}" >> "$GITHUB_ENV"
           echo "PR_NUM=${PR_NUM}" >> "$GITHUB_ENV"
-
           # Summarize
           {
             echo "### QA PR"
@@ -229,19 +235,17 @@ jobs:
         shell: bash
         env:
           SF_CONSUMER_KEY: ${{ secrets.SF_CONSUMER_KEY }}
-          SF_USERNAME:     ${{ secrets.SF_USERNAME }}
-          SF_LOGIN_URL:    ${{ secrets.SF_LOGIN_URL }}
-          SF_PRIVATE_KEY:  ${{ secrets.SF_PRIVATE_KEY }}
+          SF_USERNAME: ${{ secrets.SF_USERNAME }}
+          SF_LOGIN_URL: ${{ secrets.SF_LOGIN_URL }}
+          SF_PRIVATE_KEY: ${{ secrets.SF_PRIVATE_KEY }}
         run: |
           set -euo pipefail
-
           if [[ -z "${SF_CONSUMER_KEY}" || -z "${SF_USERNAME}" || -z "${SF_LOGIN_URL}" || -z "${SF_PRIVATE_KEY}" ]]; then
             echo "Missing one or more Salesforce JWT secrets (SF_CONSUMER_KEY/SF_USERNAME/SF_LOGIN_URL/SF_PRIVATE_KEY)" >&2
             exit 1
           fi
 
           echo "$SF_PRIVATE_KEY" > /tmp/sf_private_key.pem
-
           ISS="$SF_CONSUMER_KEY"
           SUB="$SF_USERNAME"
           AUD="$SF_LOGIN_URL"
@@ -259,7 +263,6 @@ jobs:
           RESP=$(curl -sS "$SF_LOGIN_URL/services/oauth2/token" \
             -d grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer \
             --data-urlencode assertion="$JWT")
-
           ACCESS_TOKEN=$(echo "$RESP" | jq -r '.access_token')
           INSTANCE_URL=$(echo "$RESP" | jq -r '.instance_url')
 
@@ -277,21 +280,21 @@ jobs:
         env:
           ACCESS_TOKEN: ${{ env.ACCESS_TOKEN }}
           INSTANCE_URL: ${{ env.INSTANCE_URL }}
-          WI:           ${{ steps.inp.outputs.workItemId }}
-          DUP:          ${{ steps.vars.outputs.dup_branch }}
-          BASE:         ${{ steps.inp.outputs.base }}
-          PR_URL:       ${{ env.PR_URL }}
-          PR_NUM:       ${{ env.PR_NUM }}
+          WI: ${{ steps.inp.outputs.workItemId }}
+          FEATURE: ${{ env.FEATURE }}
+          DUP: ${{ steps.vars.outputs.dup_branch }}
+          BASE: ${{ steps.inp.outputs.base }}
+          PR_URL: ${{ env.PR_URL }}
+          PR_NUM: ${{ env.PR_NUM }}
         run: |
           set -euo pipefail
-
           if [[ -z "$PR_URL" || -z "$PR_NUM" ]]; then
             echo "No PR URL/Number found; skipping Salesforce callback." >&2
             exit 0
           fi
 
           BODY=$(jq -n \
-            --arg wi  "$WI" \
+            --arg wi "$WI" \
             --arg src "$FEATURE" \
             --arg tgt "$BASE" \
             --arg num "$PR_NUM" \
