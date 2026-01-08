@@ -196,25 +196,32 @@ jobs:
             core.setOutput('number', String(pr.number));
             core.setOutput('url', pr.html_url);
 
-      # 7) Final log + export PR URL/Number for later steps
+      # 7) PR info (fix: set local vars first, then export to GITHUB_ENV)
       - name: PR info
         shell: bash
         run: |
           set -euo pipefail
 
           if [ "${{ steps.findpr.outputs.exists }}" = "true" ]; then
-            echo "Existing PR #${{ steps.findpr.outputs.number }} -> ${{ steps.findpr.outputs.url }}"
-            echo "PR_URL=${{ steps.findpr.outputs.url }}" >> $GITHUB_ENV
-            echo "PR_NUM=${{ steps.findpr.outputs.number }}" >> $GITHUB_ENV
+            PR_URL="${{ steps.findpr.outputs.url }}"
+            PR_NUM="${{ steps.findpr.outputs.number }}"
+            echo "Existing PR #${PR_NUM} -> ${PR_URL}"
           else
-            echo "New PR #${{ steps.createpr.outputs.number }} -> ${{ steps.createpr.outputs.url }}"
-            echo "PR_URL=${{ steps.createpr.outputs.url }}" >> $GITHUB_ENV
-            echo "PR_NUM=${{ steps.createpr.outputs.number }}" >> $GITHUB_ENV
+            PR_URL="${{ steps.createpr.outputs.url }}"
+            PR_NUM="${{ steps.createpr.outputs.number }}"
+            echo "New PR #${PR_NUM} -> ${PR_URL}"
           fi
 
-          echo "### QA PR" >> $GITHUB_STEP_SUMMARY
-          echo "- URL: ${PR_URL}" >> $GITHUB_STEP_SUMMARY
-          echo "- Number: ${PR_NUM}" >> $GITHUB_STEP_SUMMARY
+          # Export for subsequent steps
+          echo "PR_URL=${PR_URL}" >> "$GITHUB_ENV"
+          echo "PR_NUM=${PR_NUM}" >> "$GITHUB_ENV"
+
+          # Summarize
+          {
+            echo "### QA PR"
+            echo "- URL: ${PR_URL}"
+            echo "- Number: ${PR_NUM}"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       # 8) Get Salesforce OAuth token (JWT Bearer)
       - name: Get Salesforce OAuth token (JWT Bearer)
