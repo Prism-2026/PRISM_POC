@@ -45,6 +45,8 @@ jobs:
         id: inp
         shell: bash
         run: |
+          set -euo pipefail
+
           BRANCH="${{ github.event.client_payload.branch || inputs.branch }}"
           BASE="${{ github.event.client_payload.baseRef || inputs.baseRef || 'qa' }}"
           WI="${{ github.event.client_payload.workItemId || inputs.workItemId }}"
@@ -67,6 +69,8 @@ jobs:
         id: vars
         shell: bash
         run: |
+          set -euo pipefail
+
           FEATURE="${{ steps.inp.outputs.branch }}"
           TAIL="${FEATURE##*/}"   # e.g., feature/abc-123 -> abc-123
           SAFE=$(echo "$TAIL" | tr -cd '[:alnum:]-_' | tr '[:upper:]' '[:lower:]' | cut -c1-64)
@@ -139,15 +143,12 @@ jobs:
           BASE:       ${{ steps.inp.outputs.base }}
         with:
           script: |
-            const head = `${context.repo.owner}:${process.env.DUP_BRANCH}`;
-            const base = process.env.BASE;
-            const { data: prs } = await github.rest.pulls.list({
-              owner: context.repo.owner,
-              repo:  context.repo.repo,
-              state: 'open',
-              head,
-              base
-            });
+            const owner = context.repo.owner;
+            const repo  = context.repo.repo;
+            const head  = `${owner}:${process.env.DUP_BRANCH}`;
+            const base  = process.env.BASE;
+
+            const { data: prs } = await github.rest.pulls.list({ owner, repo, state: 'open', head, base });
             if (prs.length > 0) {
               const pr = prs[0];
               core.info(`PR already exists: #${pr.number} (${pr.html_url})`);
@@ -195,95 +196,113 @@ jobs:
             core.setOutput('number', String(pr.number));
             core.setOutput('url', pr.html_url);
 
-      # 7) Final log
+      # 7) Final log + export PR URL/Number for later steps
       - name: PR info
+        shell: bash
         run: |
+          set -euo pipefail
+
           if [ "${{ steps.findpr.outputs.exists }}" = "true" ]; then
             echo "Existing PR #${{ steps.findpr.outputs.number }} -> ${{ steps.findpr.outputs.url }}"
+            echo "PR_URL=${{ steps.findpr.outputs.url }}" >> $GITHUB_ENV
+            echo "PR_NUM=${{ steps.findpr.outputs.number }}" >> $GITHUB_ENV
           else
             echo "New PR #${{ steps.createpr.outputs.number }} -> ${{ steps.createpr.outputs.url }}"
+            echo "PR_URL=${{ steps.createpr.outputs.url }}" >> $GITHUB_ENV
+            echo "PR_NUM=${{ steps.createpr.outputs.number }}" >> $GITHUB_ENV
           fi
-      # 8) Read JWT Token
-      
-- name: Get Salesforce OAuth token (JWT Bearer)
-  shell: bash
-  env:
-    SF_CONSUMER_KEY: ${{ secrets.SF_CONSUMER_KEY }}
-    SF_USERNAME:     ${{ secrets.SF_USERNAME }}
-    SF_LOGIN_URL:    ${{ secrets.SF_LOGIN_URL }}
-    SF_PRIVATE_KEY:  ${{ secrets.SF_PRIVATE_KEY }}
-  run: |
-    set -euo pipefail
-    echo "$SF_PRIVATE_KEY" > /tmp/sf_private_key.pem
 
-    ISS="$SF_CONSUMER_KEY"
-    SUB="$SF_USERNAME"
-    AUD="$SF_LOGIN_URL"
-    NOW=$(date +%s)
-    EXP=$((NOW+300))
+          echo "### QA PR" >> $GITHUB_STEP_SUMMARY
+          echo "- URL: ${PR_URL}" >> $GITHUB_STEP_SUMMARY
+          echo "- Number: ${PR_NUM}" >> $GITHUB_STEP_SUMMARY
 
-    HEADER=$(jq -nc --arg alg RS256 --arg typ JWT '{alg:$alg,typ:$typ}')
-    CLAIMS=$(jq -nc --arg iss "$ISS" --arg sub "$SUB" --arg aud "$AUD" --argjson iat "$NOW" --argjson exp "$EXP" '{iss:$iss,sub:$sub,aud:$aud,iat:$iat,exp:$exp}')
+      # 8) Get Salesforce OAuth token (JWT Bearer)
+      - name: Get Salesforce OAuth token (JWT Bearer)
+        id: jwt
+        shell: bash
+        env:
+          SF_CONSUMER_KEY: ${{ secrets.SF_CONSUMER_KEY }}
+          SF_USERNAME:     ${{ secrets.SF_USERNAME }}
+          SF_LOGIN_URL:    ${{ secrets.SF_LOGIN_URL }}
+          SF_PRIVATE_KEY:  ${{ secrets.SF_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
 
-    B64HDR=$(echo -n "$HEADER" | openssl base64 -A | tr '+/' '-_' | tr -d '=')
-    B64CLM=$(echo -n "$CLAIMS" | openssl base64 -A | tr '+/' '-_' | tr -d '=')
-    SIG=$(printf "%s.%s" "$B64HDR" "$B64CLM" | openssl dgst -sha256 -sign /tmp/sf_private_key.pem | openssl base64 -A | tr '+/' '-_' | tr -d '=')
-    JWT="$B64HDR.$B64CLM.$SIG"
+          if [[ -z "${SF_CONSUMER_KEY}" || -z "${SF_USERNAME}" || -z "${SF_LOGIN_URL}" || -z "${SF_PRIVATE_KEY}" ]]; then
+            echo "Missing one or more Salesforce JWT secrets (SF_CONSUMER_KEY/SF_USERNAME/SF_LOGIN_URL/SF_PRIVATE_KEY)" >&2
+            exit 1
+          fi
 
-    RESP=$(curl -sS "$SF_LOGIN_URL/services/oauth2/token" \
-      -d grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer \
-      --data-urlencode assertion="$JWT")
+          echo "$SF_PRIVATE_KEY" > /tmp/sf_private_key.pem
 
-    ACCESS_TOKEN=$(echo "$RESP" | jq -r '.access_token')
-    INSTANCE_URL=$(echo "$RESP" | jq -r '.instance_url')
+          ISS="$SF_CONSUMER_KEY"
+          SUB="$SF_USERNAME"
+          AUD="$SF_LOGIN_URL"
+          NOW=$(date +%s)
+          EXP=$((NOW+300))
 
-    if [ -z "$ACCESS_TOKEN" ] || [ -z "$INSTANCE_URL" ] || [ "$ACCESS_TOKEN" = "null" ] || [ "$INSTANCE_URL" = "null" ]; then
-      echo "Failed to obtain Salesforce token: $RESP" >&2
-      exit 1
-    fi
+          HEADER=$(jq -nc --arg alg RS256 --arg typ JWT '{alg:$alg,typ:$typ}')
+          CLAIMS=$(jq -nc --arg iss "$ISS" --arg sub "$SUB" --arg aud "$AUD" --argjson iat "$NOW" --argjson exp "$EXP" '{iss:$iss,sub:$sub,aud:$aud,iat:$iat,exp:$exp}')
 
-    echo "ACCESS_TOKEN=$ACCESS_TOKEN" >> $GITHUB_ENV
-    echo "INSTANCE_URL=$INSTANCE_URL" >> $GITHUB_ENV
+          B64HDR=$(echo -n "$HEADER" | openssl base64 -A | tr '+/' '-_' | tr -d '=')
+          B64CLM=$(echo -n "$CLAIMS" | openssl base64 -A | tr '+/' '-_' | tr -d '=')
+          SIG=$(printf "%s.%s" "$B64HDR" "$B64CLM" | openssl dgst -sha256 -sign /tmp/sf_private_key.pem | openssl base64 -A | tr '+/' '-_' | tr -d '=')
+          JWT="$B64HDR.$B64CLM.$SIG"
 
-      # 9) Call Back
-     
-- name: Callback to Salesforce (create/update Pull_Request__c)
-  shell: bash
-  env:
-    ACCESS_TOKEN: ${{ env.ACCESS_TOKEN }}
-    INSTANCE_URL: ${{ env.INSTANCE_URL }}
-    WI:           ${{ steps.inp.outputs.workItemId }}
-    DUP:          ${{ steps.vars.outputs.dup_branch }}
-    BASE:         ${{ steps.inp.outputs.base }}
-    PR_URL:       ${{ steps.findpr.outputs.url || steps.createpr.outputs.url }}
-    PR_NUM:       ${{ steps.findpr.outputs.number || steps.createpr.outputs.number }}
-  run: |
-    set -euo pipefail
-    if [[ -z "$PR_URL" || -z "$PR_NUM" ]]; then
-      echo "No PR URL/Number found; skipping Salesforce callback." >&2
-      exit 0
-    fi
+          RESP=$(curl -sS "$SF_LOGIN_URL/services/oauth2/token" \
+            -d grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer \
+            --data-urlencode assertion="$JWT")
 
-    BODY=$(jq -n \
-      --arg wi  "$WI" \
-      --arg src "$DUP" \
-      --arg tgt "$BASE" \
-      --arg num "$PR_NUM" \
-      --arg url "$PR_URL" \
-      --arg stat "Open" \
-      --arg dup "$DUP" \
-      '{workItemId:$wi,sourceBranch:$src,targetBranch:$tgt,prNumber:$num,prUrl:$url,status:$stat,duplicateBranch:$dup}')
+          ACCESS_TOKEN=$(echo "$RESP" | jq -r '.access_token')
+          INSTANCE_URL=$(echo "$RESP" | jq -r '.instance_url')
 
-    HTTP_CODE=$(curl -sS -o /tmp/sf_resp.json -w '%{http_code}' \
-      -X POST "$INSTANCE_URL/services/apexrest/github/pr-callback" \
-      -H "Authorization: Bearer $ACCESS_TOKEN" \
-      -H "Content-Type: application/json" \
-      --data "$BODY")
+          if [[ -z "$ACCESS_TOKEN" || -z "$INSTANCE_URL" || "$ACCESS_TOKEN" == "null" || "$INSTANCE_URL" == "null" ]]; then
+            echo "Failed to obtain Salesforce token: $RESP" >&2
+            exit 1
+          fi
 
-    echo "Salesforce response code: $HTTP_CODE"
-    sed -n '1,200p' /tmp/sf_resp.json || true
+          echo "ACCESS_TOKEN=$ACCESS_TOKEN" >> $GITHUB_ENV
+          echo "INSTANCE_URL=$INSTANCE_URL" >> $GITHUB_ENV
 
-    if [[ "$HTTP_CODE" -lt 200 || "$HTTP_CODE" -ge 300 ]]; then
-      echo "Salesforce callback failed with HTTP $HTTP_CODE" >&2
-      exit 1
-    fi
+      # 9) Callback to Salesforce (create/update Pull_Request__c)
+      - name: Callback to Salesforce (create/update Pull_Request__c)
+        shell: bash
+        env:
+          ACCESS_TOKEN: ${{ env.ACCESS_TOKEN }}
+          INSTANCE_URL: ${{ env.INSTANCE_URL }}
+          WI:           ${{ steps.inp.outputs.workItemId }}
+          DUP:          ${{ steps.vars.outputs.dup_branch }}
+          BASE:         ${{ steps.inp.outputs.base }}
+          PR_URL:       ${{ env.PR_URL }}
+          PR_NUM:       ${{ env.PR_NUM }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "$PR_URL" || -z "$PR_NUM" ]]; then
+            echo "No PR URL/Number found; skipping Salesforce callback." >&2
+            exit 0
+          fi
+
+          BODY=$(jq -n \
+            --arg wi  "$WI" \
+            --arg src "$DUP" \
+            --arg tgt "$BASE" \
+            --arg num "$PR_NUM" \
+            --arg url "$PR_URL" \
+            --arg stat "Open" \
+            --arg dup "$DUP" \
+            '{workItemId:$wi,sourceBranch:$src,targetBranch:$tgt,prNumber:$num,prUrl:$url,status:$stat,duplicateBranch:$dup}')
+
+          HTTP_CODE=$(curl -sS -o /tmp/sf_resp.json -w '%{http_code}' \
+            -X POST "$INSTANCE_URL/services/apexrest/github/pr-callback" \
+            -H "Authorization: Bearer $ACCESS_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data "$BODY")
+
+          echo "Salesforce response code: $HTTP_CODE"
+          sed -n '1,200p' /tmp/sf_resp.json || true
+
+          if [[ "$HTTP_CODE" -lt 200 || "$HTTP_CODE" -ge 300 ]]; then
+            echo "Salesforce callback failed with HTTP $HTTP_CODE" >&2
+            exit 1
+          fi
