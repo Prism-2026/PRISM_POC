@@ -292,7 +292,7 @@ jobs:
 
           BODY=$(jq -n \
             --arg wi  "$WI" \
-            --arg src "$DUP" \
+            --arg src "$FEATURE" \
             --arg tgt "$BASE" \
             --arg num "$PR_NUM" \
             --arg url "$PR_URL" \
