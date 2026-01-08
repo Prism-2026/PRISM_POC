@@ -211,58 +211,57 @@ jobs:
           else
             echo "New PR #${{ steps.createpr.outputs.number }} -> ${{ steps.createpr.outputs.url }}"
           fi
-      # 8) Call Back
-      - name: Callback to Salesforce (create/update Pull_Request__c)
-        if: ${{ success() }}
-        env:
-          SF_BASE_URL:       ${{ secrets.SF_BASE_URL }}        # e.g., https://yourdomain.my.salesforce.com
-          SF_CALLBACK_SECRET: ${{ secrets.SF_CALLBACK_SECRET }} # same as Custom Label value
-          WI:                ${{ steps.inp.outputs.workItemId }}
-          FEATURE:           ${{ steps.inp.outputs.branch }}
-          DUP:               ${{ steps.vars.outputs.dup_branch }}
-          BASE:              ${{ steps.inp.outputs.base }}
-          PR_URL:            ${{ pr.html_url }}
-          PR_NUM:            ${{ pr.number }}
-        run: |
-          if [ -z "$PR_URL" ] || [ -z "$PR_NUM" ]; then
-            echo "No PR URL/Number found; skipping Salesforce callback." >&2
-            exit 0
-          fi
+     
 
-          # Choose sourceBranch: the duplicate branch used as PR head
-          SOURCE="$DUP"
-          TARGET="$BASE"
-          STATUS="Open"
+      
+# 8) Call Back
+- name: Callback to Salesforce (create/update Pull_Request__c)
+  if: ${{ success() }}
+  shell: bash
+  env:
+    SF_BASE_URL:        ${{ secrets.SF_BASE_URL }}         # e.g., https://yourdomain.my.salesforce.com
+    SF_CALLBACK_SECRET: ${{ secrets.SF_CALLBACK_SECRET }}  # same value as the Custom Label in Salesforce
+    WI:                 ${{ steps.inp.outputs.workItemId }}
+    DUP:                ${{ steps.vars.outputs.dup_branch }}
+    BASE:               ${{ steps.inp.outputs.base }}
+    PR_URL:             ${{ steps.findpr.outputs.url || steps.createpr.outputs.url }}
+    PR_NUM:             ${{ steps.findpr.outputs.number || steps.createpr.outputs.number }}
+  run: |
+    if [[ -z "$PR_URL" || -z "$PR_NUM" ]]; then
+      echo "No PR URL/Number found; skipping Salesforce callback." >&2
+      exit 0
+    fi
 
-          BODY=$(jq -n \
-            --arg wi "$WI" \
-            --arg src "$SOURCE" \
-            --arg tgt "$TARGET" \
-            --arg num "$PR_NUM" \
-            --arg url "$PR_URL" \
-            --arg stat "$STATUS" \
-            --arg dup "$DUP" \
-            '{
-              workItemId: $wi,
-              sourceBranch: $src,
-              targetBranch: $tgt,
-              prNumber: $num,
-              prUrl: $url,
-              status: $stat,
-              duplicateBranch: $dup
-            }')
+    # Prepare JSON body (head/source is the duplicate branch we used to open the PR)
+    BODY=$(jq -n \
+      --arg wi  "$WI" \
+      --arg src "$DUP" \
+      --arg tgt "$BASE" \
+      --arg num "$PR_NUM" \
+      --arg url "$PR_URL" \
+      --arg stat "Open" \
+      --arg dup "$DUP" \
+      '{
+        workItemId: $wi,
+        sourceBranch: $src,
+        targetBranch: $tgt,
+        prNumber: $num,
+        prUrl: $url,
+        status: $stat,
+        duplicateBranch: $dup
+      }')
 
-          echo "Posting callback to Salesforce..."
-          HTTP_CODE=$(curl -sS -o /tmp/sf_resp.json -w '%{http_code}' \
-            -X POST "$SF_BASE_URL/services/apexrest/github/pr-callback" \
-            -H "Authorization: Bearer $SF_CALLBACK_SECRET" \
-            -H "Content-Type: application/json" \
-            --data "$BODY")
+    echo "Posting callback to Salesforce..."
+    HTTP_CODE=$(curl -sS -o /tmp/sf_resp.json -w '%{http_code}' \
+      -X POST "$SF_BASE_URL/services/apexrest/github/pr-callback" \
+      -H "Authorization: Bearer $SF_CALLBACK_SECRET" \
+      -H "Content-Type: application/json" \
+      --data "$BODY")
 
-          echo "Salesforce response code: $HTTP_CODE"
-          cat /tmp/sf_resp.json || true
+    echo "Salesforce response code: $HTTP_CODE"
+    cat /tmp/sf_resp.json || true
 
-          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
-            echo "Salesforce callback failed with HTTP $HTTP_CODE" >&2
-            exit 1
-          fi
+    if [[ "$HTTP_CODE" -lt 200 || "$HTTP_CODE" -ge 300 ]]; then
+      echo "Salesforce callback failed with HTTP $HTTP_CODE" >&2
+      exit 1
+    fi
