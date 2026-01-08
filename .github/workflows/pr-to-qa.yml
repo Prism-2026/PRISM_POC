@@ -1,3 +1,4 @@
+
 name: Create PR to QA (duplicate feature branch via REST)
 
 on:
@@ -55,11 +56,11 @@ jobs:
             exit 1
           fi
 
-          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
-          echo "base=$BASE" >> "$GITHUB_OUTPUT"
-          echo "workItemId=$WI" >> "$GITHUB_OUTPUT"
-          echo "jiraUrl=$JIRA" >> "$GITHUB_OUTPUT"
-          echo "details=$DETAILS" >> "$GITHUB_OUTPUT"
+          echo "branch=$BRANCH"       >> "$GITHUB_OUTPUT"
+          echo "base=$BASE"           >> "$GITHUB_OUTPUT"
+          echo "workItemId=$WI"       >> "$GITHUB_OUTPUT"
+          echo "jiraUrl=$JIRA"        >> "$GITHUB_OUTPUT"
+          echo "details=$DETAILS"     >> "$GITHUB_OUTPUT"
 
       # 2) Compute safe duplicate branch name (slug of feature tail)
       - name: Compute dup branch name
@@ -90,18 +91,14 @@ jobs:
             const dupFullRef      = `refs/heads/${process.env.DUP}`;
 
             // 1) Get feature ref & SHA
-            const featureRef = await github.rest.git.getRef({
-              owner, repo, ref: featureHeadsRef
-            });
+            const featureRef = await github.rest.git.getRef({ owner, repo, ref: featureHeadsRef });
             const sha = featureRef.data.object.sha;
             core.info(`Feature ref: ${featureRef.data.ref} -> ${sha}`);
 
             // 2) Try to get dup ref; if present, skip creation
             let dupExists = false;
             try {
-              const existingDup = await github.rest.git.getRef({
-                owner, repo, ref: `heads/${process.env.DUP}`
-              });
+              const existingDup = await github.rest.git.getRef({ owner, repo, ref: `heads/${process.env.DUP}` });
               dupExists = !!existingDup?.data?.ref;
               core.info(`Duplicate branch already exists: ${existingDup.data.ref}`);
               core.setOutput('dup_exists', 'true');
@@ -112,9 +109,7 @@ jobs:
 
             // 3) Create duplicate ref if it doesn't exist
             if (!dupExists) {
-              await github.rest.git.createRef({
-                owner, repo, ref: dupFullRef, sha
-              });
+              await github.rest.git.createRef({ owner, repo, ref: dupFullRef, sha });
               core.info(`Created duplicate branch ref: ${dupFullRef} -> ${sha}`);
             }
 
@@ -129,9 +124,7 @@ jobs:
             const repo  = context.repo.repo;
             const base  = process.env.BASE;
             try {
-              const baseRef = await github.rest.git.getRef({
-                owner, repo, ref: `heads/${base}`
-              });
+              const baseRef = await github.rest.git.getRef({ owner, repo, ref: `heads/${base}` });
               core.info(`Base branch found: ${baseRef.data.ref}`);
             } catch (e) {
               core.setFailed(`Base branch '${base}' not found on origin.`);
@@ -210,57 +203,55 @@ jobs:
           else
             echo "New PR #${{ steps.createpr.outputs.number }} -> ${{ steps.createpr.outputs.url }}"
           fi
-     
 
-      
-# 8) Call Back
-- name: Callback to Salesforce (create/update Pull_Request__c)
-  if: ${{ success() }}
-  shell: bash
-  env:
-    SF_BASE_URL:        ${{ secrets.SF_BASE_URL }}         # e.g., https://yourdomain.my.salesforce.com
-    SF_CALLBACK_SECRET: ${{ secrets.SF_CALLBACK_SECRET }}  # same value as the Custom Label in Salesforce
-    WI:                 ${{ steps.inp.outputs.workItemId }}
-    DUP:                ${{ steps.vars.outputs.dup_branch }}
-    BASE:               ${{ steps.inp.outputs.base }}
-    PR_URL:             ${{ steps.findpr.outputs.url || steps.createpr.outputs.url }}
-    PR_NUM:             ${{ steps.findpr.outputs.number || steps.createpr.outputs.number }}
-  run: |
-    if [[ -z "$PR_URL" || -z "$PR_NUM" ]]; then
-      echo "No PR URL/Number found; skipping Salesforce callback." >&2
-      exit 0
-    fi
+      # 8) Call Back
+      - name: Callback to Salesforce (create/update Pull_Request__c)
+        if: ${{ success() }}
+        shell: bash
+        env:
+          SF_BASE_URL:        ${{ secrets.SF_BASE_URL }}         # e.g., https://yourdomain.my.salesforce.com
+          SF_CALLBACK_SECRET: ${{ secrets.SF_CALLBACK_SECRET }}  # same as Custom Label value
+          WI:                 ${{ steps.inp.outputs.workItemId }}
+          DUP:                ${{ steps.vars.outputs.dup_branch }}
+          BASE:               ${{ steps.inp.outputs.base }}
+          PR_URL:             ${{ steps.findpr.outputs.url || steps.createpr.outputs.url }}
+          PR_NUM:             ${{ steps.findpr.outputs.number || steps.createpr.outputs.number }}
+        run: |
+          if [[ -z "$PR_URL" || -z "$PR_NUM" ]]; then
+            echo "No PR URL/Number found; skipping Salesforce callback." >&2
+            exit 0
+          fi
 
-    # Prepare JSON body (head/source is the duplicate branch we used to open the PR)
-    BODY=$(jq -n \
-      --arg wi  "$WI" \
-      --arg src "$DUP" \
-      --arg tgt "$BASE" \
-      --arg num "$PR_NUM" \
-      --arg url "$PR_URL" \
-      --arg stat "Open" \
-      --arg dup "$DUP" \
-      '{
-        workItemId: $wi,
-        sourceBranch: $src,
-        targetBranch: $tgt,
-        prNumber: $num,
-        prUrl: $url,
-        status: $stat,
-        duplicateBranch: $dup
-      }')
+          # Prepare JSON body (head/source is the duplicate branch we used to open the PR)
+          BODY=$(jq -n \
+            --arg wi  "$WI" \
+            --arg src "$DUP" \
+            --arg tgt "$BASE" \
+            --arg num "$PR_NUM" \
+            --arg url "$PR_URL" \
+            --arg stat "Open" \
+            --arg dup "$DUP" \
+            '{
+              workItemId: $wi,
+              sourceBranch: $src,
+              targetBranch: $tgt,
+              prNumber: $num,
+              prUrl: $url,
+              status: $stat,
+              duplicateBranch: $dup
+            }')
 
-    echo "Posting callback to Salesforce..."
-    HTTP_CODE=$(curl -sS -o /tmp/sf_resp.json -w '%{http_code}' \
-      -X POST "$SF_BASE_URL/services/apexrest/github/pr-callback" \
-      -H "Authorization: Bearer $SF_CALLBACK_SECRET" \
-      -H "Content-Type: application/json" \
-      --data "$BODY")
+          echo "Posting callback to Salesforce..."
+          HTTP_CODE=$(curl -sS -o /tmp/sf_resp.json -w '%{http_code}' \
+            -X POST "$SF_BASE_URL/services/apexrest/github/pr-callback" \
+            -H "Authorization: Bearer $SF_CALLBACK_SECRET" \
+            -H "Content-Type: application/json" \
+            --data "$BODY")
 
-    echo "Salesforce response code: $HTTP_CODE"
-    cat /tmp/sf_resp.json || true
+          echo "Salesforce response code: $HTTP_CODE"
+          cat /tmp/sf_resp.json || true
 
-    if [[ "$HTTP_CODE" -lt 200 || "$HTTP_CODE" -ge 300 ]]; then
-      echo "Salesforce callback failed with HTTP $HTTP_CODE" >&2
-      exit 1
-    fi
+          if [[ "$HTTP_CODE" -lt 200 || "$HTTP_CODE" -ge 300 ]]; then
+            echo "Salesforce callback failed with HTTP $HTTP_CODE" >&2
+            exit 1
+          fi
